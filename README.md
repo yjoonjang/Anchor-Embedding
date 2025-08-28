@@ -27,7 +27,7 @@ torchrun --nproc_per_node=8 experiments/run_stage_I.py train_configs/stage_I/Met
 
 > [!NOTE]
 >
-> Our main contribution lies in the `llm2vec/llm2vec_q2d_d2q.py` script, which implements two bidirectional reconstruction tasks — **Query2Doc** and **Doc2Query** — via anchor embeddings.
+> Our main contribution lies in the `llm2vec/llm2vec_q2d_d2q.py` script, which implements two bidirectional reconstruction tasks — **EBQ2D** and **EBD2Q** — via anchor embeddings.
 
 ### Stage II
 
