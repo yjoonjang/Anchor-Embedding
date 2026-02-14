@@ -122,8 +122,8 @@ class CustomArguments:
         default=0.05, metadata={"help": "The dropout rate for lora"}
     )
     lora_r: int = field(default=8, metadata={"help": "The r value for lora"})
-    stop_after_n_steps: int = field(
-        default=10000, metadata={"help": "Stop training after n steps"}
+    stop_after_n_steps: Optional[int] = field(
+        default=None, metadata={"help": "Stop training after n steps (None to disable)"}
     )
     experiment_id: Optional[str] = field(
         default=None, metadata={"help": "The experiment id"}
@@ -555,6 +555,10 @@ class LLM2VecSupervisedTrainer(Trainer):
         unwrapped = _unwrap_model(self.model)
         unwrapped.save(output_dir)
 
+        # Also save as standard state_dict for HF Trainer resume compatibility
+        model_state = unwrapped.model.state_dict()
+        torch.save(model_state, os.path.join(output_dir, "pytorch_model.bin"))
+
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
 
 
@@ -592,18 +596,17 @@ def main():
                 if "/" not in model_args.model_name_or_path
                 else model_args.model_name_or_path.split("/")[-1]
             ),
-            pooling_mode=model_args.pooling_mode,
-            train_batch_size=training_args.per_device_train_batch_size
-            * accelerator.num_processes
-            * training_args.gradient_accumulation_steps,
+            train_batch_size=training_args.per_device_train_batch_size,
             max_seq_length=model_args.max_seq_length,
-            bidirectional=model_args.bidirectional,
             epochs=training_args.num_train_epochs,
-            seed=training_args.seed,
             warmup_steps=training_args.warmup_steps,
             lr=training_args.learning_rate,
             lora_r=custom_args.lora_r,
             use_peft=model_args.use_peft,
+            gradient_accumulation_steps=training_args.gradient_accumulation_steps,
+            d2q_weight=custom_args.d2q_weight,
+            q2d_weight=custom_args.q2d_weight,
+            num_gpus=accelerator.num_processes,
         )
 
     training_args.output_dir = f"{training_args.output_dir}/{experiment_id}"
@@ -687,7 +690,19 @@ def main():
             )
         )
 
-    trainer.train()
+    # Auto-detect checkpoint for resume
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir):
+        checkpoints = [
+            os.path.join(training_args.output_dir, d)
+            for d in os.listdir(training_args.output_dir)
+            if d.startswith("checkpoint-")
+        ]
+        if checkpoints:
+            last_checkpoint = max(checkpoints, key=os.path.getmtime)
+            logger.info(f"Resuming from checkpoint: {last_checkpoint}")
+
+    trainer.train(resume_from_checkpoint=last_checkpoint)
 
 
 def initialize_peft(

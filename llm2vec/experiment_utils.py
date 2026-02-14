@@ -5,37 +5,40 @@ def generate_experiment_id(
     name,
     split,
     model_name,
-    pooling_mode,
     train_batch_size,
     max_seq_length,
-    bidirectional,
     epochs,
-    seed,
     warmup_steps,
     lr,
     lora_r,
     use_peft=True,
+    gradient_accumulation_steps=1,
+    d2q_weight=None,
+    q2d_weight=None,
+    num_gpus=None,
+    pooling_mode=None,  # kept for backward compat, not used in ID
+    seed=None,  # kept for backward compat, not used in ID
 ):
     experiment_id = name + "_" + split
 
     if isinstance(model_name, str):
         experiment_id += f"_m-{model_name}"
-    if isinstance(pooling_mode, str):
-        experiment_id += f"_p-{pooling_mode}"
+    if num_gpus is not None:
+        experiment_id += f"_g-{num_gpus}"
     if isinstance(train_batch_size, int):
         experiment_id += f"_b-{train_batch_size}"
+    if isinstance(gradient_accumulation_steps, int) and gradient_accumulation_steps > 1:
+        experiment_id += f"_ga-{gradient_accumulation_steps}"
     if isinstance(max_seq_length, int):
         experiment_id += f"_l-{max_seq_length}"
-    if isinstance(bidirectional, bool):
-        experiment_id += f"_bidirectional-{bidirectional}"
-    if isinstance(epochs, int):
+    if isinstance(epochs, (int, float)):
         experiment_id += f"_e-{epochs}"
-    if isinstance(seed, int):
-        experiment_id += f"_s-{seed}"
     if isinstance(warmup_steps, int):
         experiment_id += f"_w-{warmup_steps}"
     if isinstance(lr, float):
         experiment_id += f"_lr-{lr}"
+    if d2q_weight is not None and q2d_weight is not None:
+        experiment_id += f"_d2q-{d2q_weight}_q2d-{q2d_weight}"
     if use_peft:
         if isinstance(lora_r, int):
             experiment_id += f"_lora_r-{lora_r}"
