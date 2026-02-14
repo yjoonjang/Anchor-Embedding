@@ -610,6 +610,7 @@ def main():
         )
 
     training_args.output_dir = f"{training_args.output_dir}/{experiment_id}"
+    training_args.run_name = experiment_id
 
     train_dataset = load_dataset(
         data_args.dataset_name,
