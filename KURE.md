@@ -112,6 +112,31 @@ output/stage_I/Qwen3-0.6B-q2d-d2q-WO-PEFT/{experiment_id}/
 └── ...
 ```
 
+## 중간 평가 (NanoBEIR)
+
+학습 중 검색 성능을 NanoBEIR 데이터셋으로 평가. Config에서 `eval_steps`로 주기 설정 (0이면 비활성화).
+
+- **데이터셋**: 4개 (한국어 2개 + 영어 2개)
+  - `sionic-ai/NanoBEIR-ko`: NanoMSMARCO, NanoNQ
+  - `sentence-transformers/NanoBEIR-en`: NanoMSMARCO, NanoNQ
+- **메트릭**: NDCG@10, MRR@10
+- **인코딩**: eos_token pooling + cosine similarity
+- **로깅**: WandB에 `eval/{lang}/{subset}/ndcg@10`, `eval/{lang}/{subset}/mrr@10`, `eval/avg/ndcg@10`, `eval/avg/mrr@10`
+- **실행**: rank 0에서만 실행 (DDP 환경에서 중복 방지)
+
+```json
+"eval_steps": 500,
+"eval_batch_size": 64
+```
+
+Query 인코딩 시 instruction prefix 포함:
+```
+ko: "주어진 질문에 대해 관련 문서를 검색하세요; !@#$%^&*(){query}"
+en: "Retrieve relevant documents for the given query; !@#$%^&*(){query}"
+```
+
+Corpus는 instruction 없이 separator만: `"!@#$%^&*(){document}"`
+
 ## Stage II로 이어서 학습
 
 Stage I 체크포인트를 Stage II의 `model_name_or_path` 또는 `peft_model_name_or_path`에 지정하여 contrastive learning 수행.

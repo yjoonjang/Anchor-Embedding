@@ -1,4 +1,5 @@
 import logging
+import math
 from dataclasses import dataclass, field
 import os
 import sys
@@ -140,6 +141,15 @@ class CustomArguments:
     q2d_weight: float = field(
         default=0.2, metadata={"help": "Weight for Q2D (query-to-document) reconstruction loss"}
     )
+    retrieval_eval_steps: float = field(
+        default=0, metadata={"help": "Run NanoBEIR evaluation every N steps. If <1, interpreted as ratio of total steps (0 to disable)"}
+    )
+    retrieval_eval_on_start: bool = field(
+        default=False, metadata={"help": "Run NanoBEIR evaluation before training starts"}
+    )
+    retrieval_eval_batch_size: int = field(
+        default=64, metadata={"help": "Batch size for NanoBEIR evaluation encoding"}
+    )
 
 
 @dataclass
@@ -179,6 +189,222 @@ class StopTrainingCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step >= self.stop_after_n_steps:
             control.should_training_stop = True
+
+
+class NanoBEIREvalCallback(TrainerCallback):
+    """Evaluates retrieval performance on NanoBEIR (ko+en, MSMARCO+NQ) during training."""
+
+    DATASET_CONFIGS = {
+        "ko": {
+            "repo": "sionic-ai/NanoBEIR-ko",
+            "subsets": ["NanoMSMARCO", "NanoNQ"],
+            "instruction": "주어진 질문에 대해 관련 문서를 검색하세요",
+        },
+        "en": {
+            "repo": "sentence-transformers/NanoBEIR-en",
+            "subsets": ["NanoMSMARCO", "NanoNQ"],
+            "instruction": "Retrieve relevant documents for the given query",
+        },
+    }
+
+    def __init__(self, model, eval_steps: float, eval_batch_size: int = 64, eval_on_start: bool = False):
+        self.model = model
+        self._eval_steps_raw = eval_steps  # raw value, might be ratio (<1)
+        self.eval_steps = None  # resolved to int in on_train_begin
+        self.eval_batch_size = eval_batch_size
+        self.eval_on_start = eval_on_start
+        self.datasets = {}
+        self._loaded = False
+
+    def _run_eval(self, args, state):
+        """Run evaluation and return metrics dict."""
+        if args.local_process_index != 0:
+            return
+
+        if not self._loaded:
+            self._load_datasets()
+
+        logger.info(f"Running NanoBEIR evaluation at step {state.global_step}")
+
+        was_training = self.model.training
+        self.model.eval()
+
+        all_metrics = {}
+
+        for key, data in self.datasets.items():
+            lang, subset = key.split("/")
+            instruction = data["instruction"]
+            queries = data["queries"]
+            corpus = data["corpus"]
+            qrels = data["qrels"]
+
+            query_texts = [
+                f"{instruction}; !@#$%^&*(){q['text']}" for q in queries
+            ]
+            corpus_texts = [f"!@#$%^&*(){c['text']}" for c in corpus]
+
+            query_ids = [q["_id"] for q in queries]
+            corpus_ids = [c["_id"] for c in corpus]
+
+            query_embs = self._encode(query_texts, self.eval_batch_size)
+            corpus_embs = self._encode(corpus_texts, self.eval_batch_size)
+
+            metrics = self._compute_metrics(
+                query_embs, corpus_embs, qrels, query_ids, corpus_ids
+            )
+
+            for metric_name, value in metrics.items():
+                all_metrics[f"eval/{lang}/{subset}/{metric_name}"] = value
+
+            logger.info(
+                f"  NanoBEIR {key}: NDCG@10={metrics['ndcg@10']:.4f}, MRR@10={metrics['mrr@10']:.4f}"
+            )
+
+        # Compute averages across all datasets
+        ndcg_vals = [v for k, v in all_metrics.items() if "ndcg@10" in k]
+        mrr_vals = [v for k, v in all_metrics.items() if "mrr@10" in k]
+        if ndcg_vals:
+            all_metrics["eval/avg/ndcg@10"] = sum(ndcg_vals) / len(ndcg_vals)
+        if mrr_vals:
+            all_metrics["eval/avg/mrr@10"] = sum(mrr_vals) / len(mrr_vals)
+
+        # Log to WandB
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.log(all_metrics, step=state.global_step)
+        except ImportError:
+            pass
+
+        if was_training:
+            self.model.train()
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # Resolve ratio-based eval_steps to absolute step count
+        if self._eval_steps_raw > 0 and self._eval_steps_raw < 1:
+            self.eval_steps = max(1, int(state.max_steps * self._eval_steps_raw))
+            logger.info(
+                f"NanoBEIR eval_steps resolved: {self._eval_steps_raw} * {state.max_steps} = {self.eval_steps} steps"
+            )
+        else:
+            self.eval_steps = int(self._eval_steps_raw)
+
+        if self.eval_on_start:
+            self._run_eval(args, state)
+
+    def _load_datasets(self):
+        from datasets import load_dataset as hf_load_dataset
+
+        for lang, cfg in self.DATASET_CONFIGS.items():
+            for subset in cfg["subsets"]:
+                key = f"{lang}/{subset}"
+                try:
+                    queries = hf_load_dataset(cfg["repo"], "queries", split=subset)
+                    corpus = hf_load_dataset(cfg["repo"], "corpus", split=subset)
+                    qrels = hf_load_dataset(cfg["repo"], "qrels", split=subset)
+                    self.datasets[key] = {
+                        "queries": queries,
+                        "corpus": corpus,
+                        "qrels": qrels,
+                        "instruction": cfg["instruction"],
+                    }
+                    logger.info(
+                        f"Loaded NanoBEIR {key}: {len(queries)} queries, {len(corpus)} corpus docs"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to load NanoBEIR {key}: {e}")
+        self._loaded = True
+
+    @torch.no_grad()
+    def _encode(self, texts, batch_size):
+        """Encode texts using the model with eos_token pooling."""
+        all_embeddings = []
+        device = next(self.model.parameters()).device
+
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i : i + batch_size]
+            prepared = [
+                prepare_for_tokenization_qwen3(self.model, t) for t in batch_texts
+            ]
+            features = self.model.tokenize(prepared)
+            features = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in features.items()
+            }
+            embeddings = self.model(features)
+            all_embeddings.append(embeddings.cpu())
+
+        return torch.cat(all_embeddings, dim=0)
+
+    def _compute_metrics(self, query_embs, corpus_embs, qrels, query_ids, corpus_ids, k=10):
+        """Compute NDCG@k and MRR@k."""
+        query_embs = torch.nn.functional.normalize(query_embs, p=2, dim=1)
+        corpus_embs = torch.nn.functional.normalize(corpus_embs, p=2, dim=1)
+
+        sim = torch.mm(query_embs, corpus_embs.t())
+
+        # Build relevance mapping: query_id -> {corpus_id: score}
+        relevance = {}
+        for item in qrels:
+            qid = str(item["query-id"])
+            cid = str(item["corpus-id"])
+            score = item.get("score", 1)
+            if qid not in relevance:
+                relevance[qid] = {}
+            relevance[qid][cid] = score
+
+        ndcg_scores = []
+        mrr_scores = []
+
+        for q_idx, qid in enumerate(query_ids):
+            qid_str = str(qid)
+            if qid_str not in relevance:
+                continue
+
+            top_k = torch.topk(sim[q_idx], min(k, sim.shape[1]))
+            top_k_indices = top_k.indices.tolist()
+
+            rel_labels = []
+            for idx in top_k_indices:
+                cid = str(corpus_ids[idx])
+                rel_labels.append(relevance[qid_str].get(cid, 0))
+
+            # MRR@k
+            mrr = 0.0
+            for rank, rel in enumerate(rel_labels, 1):
+                if rel > 0:
+                    mrr = 1.0 / rank
+                    break
+            mrr_scores.append(mrr)
+
+            # NDCG@k
+            dcg = sum(
+                rel / math.log2(rank + 1)
+                for rank, rel in enumerate(rel_labels, 1)
+            )
+            ideal_rels = sorted(relevance[qid_str].values(), reverse=True)[:k]
+            idcg = sum(
+                rel / math.log2(rank + 1)
+                for rank, rel in enumerate(ideal_rels, 1)
+            )
+            ndcg = dcg / idcg if idcg > 0 else 0.0
+            ndcg_scores.append(ndcg)
+
+        return {
+            "ndcg@10": sum(ndcg_scores) / len(ndcg_scores) if ndcg_scores else 0.0,
+            "mrr@10": sum(mrr_scores) / len(mrr_scores) if mrr_scores else 0.0,
+        }
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self.eval_steps or self.eval_steps <= 0:
+            return
+        if state.global_step % self.eval_steps != 0 or state.global_step == 0:
+            return
+        self._run_eval(args, state)
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self._run_eval(args, state)
 
 
 class LLM2VecSupervisedTrainer(Trainer):
@@ -450,6 +676,16 @@ def main():
 
     if custom_args.stop_after_n_steps is not None:
         trainer.add_callback(StopTrainingCallback(custom_args.stop_after_n_steps))
+
+    if custom_args.retrieval_eval_steps > 0:
+        trainer.add_callback(
+            NanoBEIREvalCallback(
+                model=model,
+                eval_steps=custom_args.retrieval_eval_steps,
+                eval_batch_size=custom_args.retrieval_eval_batch_size,
+                eval_on_start=custom_args.retrieval_eval_on_start,
+            )
+        )
 
     trainer.train()
 
