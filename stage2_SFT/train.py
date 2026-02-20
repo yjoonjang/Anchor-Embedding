@@ -130,6 +130,8 @@ def train(
 	temperature: float = 0.01,
 	margin_strategy: str = "absolute",
 	margin: float = -0.1,
+	hardness_alpha: float = 0.0,
+	hardness_mode: str = "all",
 	# Training
 	output_dir: str = "/data_x/yjoonjang/PAPERS/Anchor-Embedding/MODELS/stage2",
 	num_epochs: int = 1,
@@ -146,6 +148,7 @@ def train(
 	bf16: bool = True,
 	seed: int = 42,
 	gradient_checkpointing: bool = False,
+	eval_on_start: bool = False,
 	dataloader_num_workers: int = 4,
 	# Wandb
 	use_wandb: bool = True,
@@ -207,6 +210,8 @@ def train(
 			f"  margin_strategy: {margin_strategy}\n"
 			f"  margin:          {margin}\n"
 			f"  temperature:     {temperature}\n"
+			f"  hardness_alpha:  {hardness_alpha}\n"
+			f"  hardness_mode:   {hardness_mode}\n"
 			f"  run_name:        {run_name}\n"
 		)
 
@@ -269,6 +274,10 @@ def train(
 		temperature=temperature,
 		margin_strategy=margin_strategy,
 		margin=margin,
+		contrast_anchors=False,
+		contrast_positives=False,
+		hardness_alpha=hardness_alpha,
+		hardness_mode=hardness_mode,
 	)
 
 	# --- Training arguments ---
@@ -291,10 +300,10 @@ def train(
 		bf16=bf16,
 		seed=seed,
 		gradient_checkpointing=gradient_checkpointing,
+		eval_on_start=eval_on_start,
 		report_to="wandb" if use_wandb else [],
 		run_name=run_name,
 		dataloader_num_workers=dataloader_num_workers,
-		batch_sampler=BatchSamplers.NO_DUPLICATES,
 		prompts={"anchor": query_prompt},
 	)
 

@@ -76,6 +76,8 @@ class CachedGISTEmbedLoss(nn.Module):
         contrast_anchors: bool = True,
         contrast_positives: bool = True,
         gather_across_devices: bool = False,
+        hardness_alpha: float = 0.0,
+        hardness_mode: Literal["all", "hard_only"] = "all",
     ) -> None:
         """
         CachedGISTEmbedLoss with self-guided mode support.
@@ -93,6 +95,11 @@ class CachedGISTEmbedLoss(nn.Module):
             contrast_anchors: Include anchor-anchor pairs in loss.
             contrast_positives: Include positive-positive pairs in loss.
             gather_across_devices: Gather embeddings across GPUs for larger effective batch.
+            hardness_alpha: Strength of hardness-weighted contrastive learning (Lan et al. 2025).
+                Higher values emphasize harder negatives more. Recommended ~5.0. 0.0 to disable.
+            hardness_mode: Strategy for applying hardness weighting:
+                - "all": Adds alpha * stop_grad(cos_sim) penalty to every negative logit.
+                - "hard_only": Weights each sample's loss by its hardest explicit negative.
         """
         super().__init__()
         if isinstance(model[0], StaticEmbedding):
@@ -146,6 +153,14 @@ class CachedGISTEmbedLoss(nn.Module):
         self.contrast_anchors = contrast_anchors
         self.contrast_positives = contrast_positives
         self.gather_across_devices = gather_across_devices
+
+        if hardness_alpha < 0.0:
+            raise ValueError("hardness_alpha must be non-negative.")
+        self.hardness_alpha = hardness_alpha
+        if hardness_mode not in ("all", "hard_only"):
+            raise ValueError(f"hardness_mode must be 'all' or 'hard_only', got {hardness_mode}")
+        self.hardness_mode = hardness_mode
+
         self.cross_entropy_loss = nn.CrossEntropyLoss()
 
     def sim_matrix(self, embed1: Tensor, embed2: Tensor) -> Tensor:
@@ -246,6 +261,25 @@ class CachedGISTEmbedLoss(nn.Module):
 
         range_labels = torch.arange(offset, offset + batch_size, device=anchors.device)
 
+        # Precompute hardness weights for "hard_only" mode
+        if self.hardness_alpha > 0.0 and self.hardness_mode == "hard_only" and len(candidates) > 1:
+            with torch.no_grad():
+                hardness_weights = (
+                    torch.stack(
+                        [
+                            nn.functional.cosine_similarity(anchors, neg[offset : offset + batch_size], dim=-1)
+                            for neg in candidates[1:]
+                        ],
+                        dim=0,
+                    )
+                    .max(dim=0)
+                    .values
+                )
+                hardness_weights = torch.exp(self.hardness_alpha * hardness_weights)
+                total_weight_sum = hardness_weights.sum()
+        else:
+            hardness_weights = None
+
         losses: list[torch.Tensor] = []
         for begin in tqdm.trange(
             0,
@@ -303,9 +337,22 @@ class CachedGISTEmbedLoss(nn.Module):
 
             scores = torch.cat(scores, dim=1)
             scores = scores / self.temperature
-            loss_mbatch: torch.Tensor = (
-                self.cross_entropy_loss(scores, range_labels[begin:end]) * len(scores) / batch_size
-            )
+
+            # Apply hardness penalty to negative logits (Lan et al. 2025, Eq. 5)
+            if self.hardness_alpha > 0.0 and self.hardness_mode == "all":
+                raw_scores = (scores * self.temperature).detach()
+                penalty = self.hardness_alpha * raw_scores
+                penalty[torch.arange(len(scores), device=anchors.device), range_labels[begin:end]] = 0.0
+                scores = scores + penalty
+
+            if hardness_weights is not None:
+                mb_weights = hardness_weights[begin:end]
+                per_sample_loss = nn.functional.cross_entropy(scores, range_labels[begin:end], reduction="none")
+                loss_mbatch: torch.Tensor = (mb_weights * per_sample_loss).sum() / total_weight_sum
+            else:
+                loss_mbatch: torch.Tensor = (
+                    self.cross_entropy_loss(scores, range_labels[begin:end]) * len(scores) / batch_size
+                )
             if with_backward:
                 loss_mbatch.backward()
                 loss_mbatch = loss_mbatch.detach()
@@ -351,4 +398,6 @@ class CachedGISTEmbedLoss(nn.Module):
             "contrast_anchors": self.contrast_anchors,
             "contrast_positives": self.contrast_positives,
             "gather_across_devices": self.gather_across_devices,
+            "hardness_alpha": self.hardness_alpha,
+            "hardness_mode": self.hardness_mode,
         }
